@@ -1,0 +1,6 @@
+apiVersion: docker.com/v1alpha1
+kind: Compose
+metadata:
+  name: compose-sample
+spec:
+  # TODO(user): Add fields here
