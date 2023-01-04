@@ -43,7 +43,7 @@ type ComposeStatus struct {
 //+kubebuilder:subresource:status
 
 // Compose is the Schema for the composes API
-//+kubebuilder:subresource:status
+// +kubebuilder:subresource:status
 type Compose struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

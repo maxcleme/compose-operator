@@ -50,6 +50,7 @@ type ComposeReconciler struct {
 //+kubebuilder:rbac:groups=docker.com,resources=composes/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=docker.com,resources=composes/finalizers,verbs=update
 //+kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
@@ -96,7 +97,12 @@ func (r *ComposeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		serviceIndex[s.Name] = struct{}{}
 
 		// Define a new deployment
-		dep, err := r.deploymentForService(c, project, s)
+		dep, err := r.deploymentForService(ctx, c, project, s)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		// Define a new service
+		svc, err := r.svcForService(ctx, c, project, s)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -105,10 +111,15 @@ func (r *ComposeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		found := &appsv1.Deployment{}
 		err = r.Get(ctx, types.NamespacedName{Name: dep.Name, Namespace: dep.Namespace}, found)
 		if err != nil && errors.IsNotFound(err) {
-			log.Info("Creating a new Deployment", "Deployment.Namespace", dep.Namespace, "Deployment.Name", dep.Name)
+			log.Info("Creating a new Deployment & Service", "Deployment.Namespace", dep.Namespace, "Deployment.Name", dep.Name)
 			err = r.Create(ctx, dep)
 			if err != nil {
 				log.Error(err, "Failed to create Deployment")
+				return ctrl.Result{}, err
+			}
+			err = r.Create(ctx, svc)
+			if err != nil {
+				log.Error(err, "Failed to create Service")
 				return ctrl.Result{}, err
 			}
 			continue
@@ -123,24 +134,45 @@ func (r *ComposeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			log.Error(err, "Failed to patch Deployment")
 			return ctrl.Result{}, err
 		}
+		log.Info("Patching Service", "Service.Namespace", svc.Namespace, "Service.Name", svc.Name)
+		if err := r.Update(ctx, svc); err != nil {
+			log.Error(err, "Failed to patch Service")
+			return ctrl.Result{}, err
+		}
 	}
 
-	list := &appsv1.DeploymentList{}
+	depList := &appsv1.DeploymentList{}
 	listOpts := []client.ListOption{
 		client.InNamespace(c.Namespace),
 		client.MatchingLabels{"project": project.Name},
 	}
-	if err = r.List(ctx, list, listOpts...); err != nil {
+	if err = r.List(ctx, depList, listOpts...); err != nil {
 		log.Error(err, "Failed to list all Deployments")
 		return ctrl.Result{}, err
 	}
 
 	// check if some are missing, implying service deletion
-	for _, dep := range list.Items {
-		if _, ok := serviceIndex[dep.Labels["service"]]; !ok {
+	for _, dep := range depList.Items {
+		if _, ok := serviceIndex[dep.Labels["name"]]; !ok {
 			// service has been deleted
 			log.Info("Deleting Deployment", "Deployment.Namespace", dep.Namespace, "Deployment.Name", dep.Name)
 			if err := r.Delete(ctx, &dep); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+	}
+
+	svcList := &corev1.ServiceList{}
+	if err = r.List(ctx, svcList, listOpts...); err != nil {
+		log.Error(err, "Failed to list all Service")
+		return ctrl.Result{}, err
+	}
+	// check if some are missing, implying service deletion
+	for _, svc := range svcList.Items {
+		if _, ok := serviceIndex[svc.Labels["name"]]; !ok {
+			// service has been deleted
+			log.Info("Deleting Service", "Service.Namespace", svc.Namespace, "Service.Name", svc.Name)
+			if err := r.Delete(ctx, &svc); err != nil {
 				return ctrl.Result{}, err
 			}
 		}
@@ -157,10 +189,10 @@ func (r *ComposeReconciler) SetupWithManager(mgr ctrl.Manager) error {
 }
 
 func labelsForService(p *composeTypes.Project, s composeTypes.ServiceConfig) map[string]string {
-	return map[string]string{"project": p.Name, "service": s.Name}
+	return map[string]string{"project": p.Name, "name": s.Name}
 }
 
-func (r *ComposeReconciler) deploymentForService(c *dockercomv1alpha1.Compose, p *composeTypes.Project, s composeTypes.ServiceConfig) (*appsv1.Deployment, error) {
+func (r *ComposeReconciler) deploymentForService(ctx context.Context, c *dockercomv1alpha1.Compose, p *composeTypes.Project, s composeTypes.ServiceConfig) (*appsv1.Deployment, error) {
 	ls := labelsForService(p, s)
 
 	replicas := int32(1)
@@ -170,7 +202,7 @@ func (r *ComposeReconciler) deploymentForService(c *dockercomv1alpha1.Compose, p
 
 	dep := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("compose-%s-%s", p.Name, s.Name),
+			Name:      s.Name,
 			Namespace: c.Namespace,
 			Labels:    ls,
 		},
@@ -185,8 +217,9 @@ func (r *ComposeReconciler) deploymentForService(c *dockercomv1alpha1.Compose, p
 				},
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{{
-						Image: s.Image,
-						Name:  s.Name,
+						Image:           getImage(ctx, c, s),
+						ImagePullPolicy: corev1.PullIfNotPresent,
+						Name:            s.Name,
 					}},
 				},
 			},
@@ -194,4 +227,42 @@ func (r *ComposeReconciler) deploymentForService(c *dockercomv1alpha1.Compose, p
 	}
 
 	return dep, ctrl.SetControllerReference(c, dep, r.Scheme)
+}
+
+func (r *ComposeReconciler) svcForService(ctx context.Context, c *dockercomv1alpha1.Compose, p *composeTypes.Project, s composeTypes.ServiceConfig) (*corev1.Service, error) {
+	ls := labelsForService(p, s)
+
+	var ports []corev1.ServicePort
+	for _, p := range s.Ports {
+		log := ctrllog.FromContext(ctx)
+		log.Info("ports", "port", p)
+		ports = append(ports, corev1.ServicePort{
+			Port: int32(p.Target),
+		})
+	}
+
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf(s.Name),
+			Namespace: c.Namespace,
+			Labels:    ls,
+		},
+		Spec: corev1.ServiceSpec{
+			Ports:    ports,
+			Selector: map[string]string{"name": s.Name},
+		},
+	}
+
+	return svc, ctrl.SetControllerReference(c, svc, r.Scheme)
+}
+
+func getImage(_ context.Context, c *dockercomv1alpha1.Compose, s composeTypes.ServiceConfig) string {
+	if s.Image != "" {
+		return s.Image
+	}
+	key := fmt.Sprintf("%s-image", s.Name)
+	if image, ok := c.GetLabels()[key]; ok {
+		return image
+	}
+	return ""
 }
